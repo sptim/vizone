@@ -1,0 +1,108 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use DNS::ZoneParse;
+use Getopt::Long qw(GetOptions);
+use File::Basename;
+use Cwd 'abs_path';
+
+my ($verbose,$readonly);
+GetOptions(
+	'verbose'=>\$verbose,
+	'readonly'=>\$readonly,
+) or usage();
+
+sub usage {
+	print "Usage: $0 [--verbose] [--readonly] [ZONEFILE] [ZONEFILE]...\n";
+	exit 1; 
+}
+
+sub verbose {
+	print @_ if ($verbose);
+}
+
+sub zone {
+	my ($zonefile)=@_;
+	my $soa=DNS::ZoneParse->new($zonefile)->soa();
+	my $zone=$soa->{'origin'};
+	$zone.=$soa->{'ORIGIN'} unless $zone=~m/\.$/;
+	$zone=~s/\.$//;
+	return $zone;
+}
+
+sub serial {
+	my ($zonefile)=@_;
+	my $soa=DNS::ZoneParse->new($zonefile)->soa();
+	my $serial=$soa->{'serial'};
+	return $serial;
+}
+
+foreach my $zonefile (@ARGV) {
+	$zonefile=abs_path($zonefile);
+	my $dirname=basename(dirname($zonefile));
+	if($dirname eq "slave") {
+		print "Skipping slave zone file $zonefile\n";
+	}
+	else {
+		my $view=$dirname if $dirname eq 'external' or $dirname eq 'internal';
+		my $zone=zone($zonefile);
+		verbose "Zonefile $zonefile, zone $zone\n";
+		
+		verbose "Trying to freeze zone - fails if zone is not dynamic: rndc freeze $zone IN $view\n";
+		system("rndc freeze $zone IN $view");
+		
+		if ($readonly) {
+			my $pager=$ENV{'pager'};
+			$pager='view' unless $pager;
+			verbose "Launching pager: $pager \"$zonefile\"\n";
+			system("$pager \"$zonefile\"");
+		}
+		else {
+			my $oldserial=serial($zonefile);
+			my $oldmtime=(stat($zonefile))[9];
+			
+			while(1) {
+				my $editor=$ENV{'editor'};
+				$editor='vi' unless $editor;
+				verbose "Launching editor: $editor \"$zonefile\"\n";
+				system("$editor \"$zonefile\"");
+			
+				if((stat($zonefile))[9] eq $oldmtime) {
+					verbose "File unchanged\n";
+					last;
+				}
+				
+				my $zone=DNS::ZoneParse->new($zonefile);
+				last if $zone->soa()->{'serial'} ne $oldserial;
+				
+				my $solution;
+				while(1) {
+					print "Serial number not updated! - (E)dit, (A)uto-Increase, or (I)gnore?";
+					$_=<STDIN>;
+					m/(\S)/;
+					$solution=lc($1);
+					last if $solution=~m/[eai]/;
+				}
+				
+				
+				if ($solution eq 'a') {
+					$zone->new_serial(1);
+					rename "$zonefile","$zonefile~" or print "Cannot create backup of zonefile: $!\n";
+					if(open (OUT,">$zonefile")) {
+						print OUT $zone->output();
+						close(OUT);
+					}
+					else {
+						print "Cannot write to \"$zonefile\": $!\n";
+						last;
+					}
+				}
+				last unless $solution eq "e";
+			}
+		}
+		
+		verbose "Unfreezing and reloading zone: rndc thaw $zone IN $view\n";
+		system("rndc thaw $zone IN $view");
+	}
+}
